@@ -1,85 +1,147 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 require("dotenv/config");
-const express_1 = __importDefault(require("express"));
-const multer_1 = __importDefault(require("multer"));
-const app = (0, express_1.default)();
-const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage() });
-const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-const prompt = "Extract the total amount from this receipt image.\n" +
-    "Return ONLY valid JSON in this format:\n" +
-    '{ "total_amount": number | null }\n' +
-    "Use the final amount paid (NOT subtotal, NOT VAT).";
-const parseGeminiJson = (text) => {
-    const trimmed = text.trim();
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    const candidate = start !== -1 && end !== -1 && end > start
-        ? trimmed.slice(start, end + 1)
-        : trimmed;
-    try {
-        const parsed = JSON.parse(candidate);
-        if (typeof parsed.total_amount === "number" || parsed.total_amount === null) {
-            return { total_amount: parsed.total_amount };
-        }
-    }
-    catch {
-        // Fall through to null result.
-    }
-    return { total_amount: null };
-};
-app.post("/api/extract-receipt", upload.single("image"), async (req, res) => {
-    try {
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-            return res
-                .status(500)
-                .json({ total_amount: null, error: "GEMINI_API_KEY is not set" });
-        }
-        const file = req.file;
-        if (!file) {
-            return res
-                .status(400)
-                .json({ total_amount: null, error: "Image file is required" });
-        }
-        const base64 = file.buffer.toString("base64");
-        const mimeType = file.mimetype || "image/jpeg";
-        const body = {
-            contents: [
-                {
-                    role: "user",
-                    parts: [
-                        { text: prompt },
-                        { inlineData: { data: base64, mimeType } },
-                    ],
-                },
-            ],
-        };
-        const geminiResponse = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-        });
-        if (!geminiResponse.ok) {
-            const errorText = await geminiResponse.text().catch(() => "");
-            return res.status(500).json({
-                total_amount: null,
-                error: `Gemini API error: ${geminiResponse.status} ${geminiResponse.statusText}${errorText ? ` - ${errorText}` : ""}`,
+const express = require("express");
+const multer = require("multer");
+const tesseract_js_1 = require("tesseract.js");
+const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
+const numberRegex = /-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?/g;
+const yearRegex = /\b(19|20)\d{2}\b/;
+const dateNumericRegex = /\b\d{1,2}[\/\-\.]\d{1,2}(?:[\/\-\.]\d{2,4})?\b/;
+const monthRegex = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b/i;
+const timeRegex = /\b\d{1,2}:\d{2}(?::\d{2})?\b/;
+const dateKeywordRegex = /\b(date|time)\b/i;
+const idRefRegex = /\b(id|ref|reference|order|transaction|trans|trx|tnx|rrn|stan|approval|auth|invoice|inv|terminal|serial|trace)\b/i;
+const phoneRegex = /\+?\d[\d\s-]{9,}/;
+const currencyRegex = /(\$|\u20B1|\bphp\b|\bpeso(?:s)?\b|\bP\s*\d)/i;
+const keywordPatterns = [
+    /\btotal amount sent\b/i,
+    /\btotal\b/i,
+    /\bgrand total\b/i,
+    /\bamount due\b/i,
+    /\bamount sent\b/i,
+    /\btotal amount\b/i,
+    /\btotal paid\b/i,
+    /\bbalance due\b/i,
+];
+const hasKeyword = (text) => keywordPatterns.some((pattern) => pattern.test(text));
+const hasCurrency = (text) => currencyRegex.test(text);
+const hasDateTime = (line) => dateNumericRegex.test(line) ||
+    monthRegex.test(line) ||
+    timeRegex.test(line) ||
+    dateKeywordRegex.test(line);
+const scoreCandidates = (raw) => {
+    const lines = raw.split(/\r?\n/);
+    const totalLines = Math.max(lines.length, 1);
+    const candidates = [];
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line)
+            continue;
+        const region = [lines[i - 1] ?? "", lines[i], lines[i + 1] ?? ""].join(" ");
+        const keywordNear = hasKeyword(region);
+        const currencyNear = hasCurrency(region);
+        const lineHasDateTime = hasDateTime(lines[i]);
+        const lineHasIdRef = idRefRegex.test(lines[i]);
+        const lineHasPhone = phoneRegex.test(lines[i]);
+        const isLastThird = i >= Math.floor(totalLines * 0.7);
+        const matches = lines[i].match(numberRegex) || [];
+        for (const match of matches) {
+            const digitsOnly = match.replace(/\D/g, "");
+            if (!digitsOnly)
+                continue;
+            const value = Number(match.replace(/,/g, ""));
+            if (Number.isNaN(value))
+                continue;
+            const isYear = digitsOnly.length === 4 && yearRegex.test(digitsOnly);
+            if (isYear)
+                continue;
+            if (lineHasDateTime && !keywordNear && !currencyNear)
+                continue;
+            if (lineHasPhone && !keywordNear && !currencyNear)
+                continue;
+            if (digitsOnly.length >= 8 && lineHasIdRef)
+                continue;
+            let score = 0;
+            if (keywordNear)
+                score += 100;
+            if (currencyNear)
+                score += 80;
+            if (isLastThird)
+                score += 50;
+            if (lineHasDateTime || lineHasIdRef)
+                score -= 100;
+            if (digitsOnly.length > 6)
+                score -= 50;
+            if (/\.\d{2}$/.test(match))
+                score += 20;
+            candidates.push({
+                value,
+                score,
+                line,
+                lineIndex: i,
+                keywordHit: keywordNear,
             });
         }
-        const data = (await geminiResponse.json());
-        const text = data?.candidates?.[0]?.content?.parts
-            ?.map((part) => part.text ?? "")
-            .join("")
-            .trim() ?? "";
-        return res.json(parseGeminiJson(text));
     }
-    catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
-        return res.status(500).json({ total_amount: null, error: message });
+    return candidates;
+};
+app.post("/api/extract-receipt", upload.single("image"), async (req, res) => {
+    let worker = null;
+    let ocrText = "";
+    try {
+        const file = req.file;
+        if (!file) {
+            return res.status(400).json({
+                total_amount: null,
+                raw_text: "",
+                top_candidates: [],
+                error: "Image file is required",
+            });
+        }
+        worker = await (0, tesseract_js_1.createWorker)({
+            logger: () => { },
+        });
+        await worker.loadLanguage("eng");
+        await worker.initialize("eng");
+        const { data: { text }, } = await worker.recognize(file.buffer);
+        ocrText = text ?? "";
+        const candidates = scoreCandidates(ocrText);
+        const keywordCandidates = candidates.filter((c) => c.keywordHit);
+        const selectionPool = keywordCandidates.length > 0 ? keywordCandidates : candidates;
+        const sortedSelection = [...selectionPool].sort((a, b) => b.score - a.score || b.value - a.value);
+        const sortedAll = [...candidates].sort((a, b) => b.score - a.score || b.value - a.value);
+        const total = sortedSelection.length > 0 ? sortedSelection[0].value : null;
+        const topCandidates = sortedAll.slice(0, 3).map((c) => ({
+            value: c.value,
+            score: c.score,
+            line: c.line,
+        }));
+        return res.json({
+            total_amount: total,
+            raw_text: ocrText,
+            top_candidates: topCandidates,
+        });
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return res.status(500).json({
+            total_amount: null,
+            raw_text: ocrText,
+            top_candidates: [],
+            error: message,
+        });
+    }
+    finally {
+        if (worker) {
+            try {
+                await worker.terminate();
+            }
+            catch {
+                // ignore termination errors
+            }
+        }
     }
 });
 const port = Number(process.env.PORT) || 3000;

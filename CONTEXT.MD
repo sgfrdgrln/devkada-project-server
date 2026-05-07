@@ -1,41 +1,60 @@
-// I am building a Node.js + TypeScript Express API server.
-// This endpoint will receive a receipt image from a React Native Expo app (multipart/form-data).
-//
-// REQUIREMENTS:
-//
-// 1. Create an Express POST route: /api/extract-receipt
-//
-// 2. It receives:
-//    - field name: "image" (multer file upload)
-//
-// 3. Convert uploaded image to base64
-//
-// 4. Call Google Gemini API (generative language API):
-//    - model: gemini-1.5-flash
-//    - API key from process.env.GEMINI_API_KEY
-//
-// 5. Prompt Gemini:
-//    "Extract the total amount from this receipt image.
-//     Return ONLY valid JSON in this format:
-//     { \"total_amount\": number | null }
-//     Use the final amount paid (NOT subtotal, NOT VAT)."
-//
-// 6. Send image using inlineData (base64) in Gemini request
-//
-// 7. Parse Gemini response safely:
-//    - Extract text output
-//    - JSON.parse it
-//    - fallback to { total_amount: null } if parsing fails
-//
-// 8. Return JSON response to client:
-//
-//    {
-//      total_amount: number | null
-//    }
-//
-// 9. Handle errors properly:
-//    - return 500 with { total_amount: null, error: string }
-//
-// 10. Use TypeScript types for request, response, and multer file
-//
-// 11. Keep code clean and production-ready (no pseudo code)
+Refactor this Express + Tesseract.js receipt OCR endpoint into a SMART receipt parser.
+
+CURRENT ISSUE:
+The system incorrectly selects random numbers (dates, IDs, timestamps) as the total amount because it uses Math.max() and weak keyword matching.
+
+GOAL:
+Build a robust receipt extraction algorithm that correctly identifies the TOTAL AMOUNT from noisy OCR text.
+
+REQUIREMENTS:
+
+1. REMOVE unsafe fallback:
+   - Do NOT use Math.max(...allNumbers) as final decision
+
+2. ADD NOISE FILTERING:
+   - Remove or ignore:
+     - dates (e.g. May 7, 2026, 07/05/2026)
+     - years (4-digit numbers like 2026)
+     - timestamps (HH:MM)
+     - transaction IDs (long numeric strings)
+     - reference/order numbers
+
+3. IMPROVE KEYWORD DETECTION:
+   Match more variations of TOTAL such as:
+   - total
+   - grand total
+   - amount due
+   - amount sent
+   - total amount
+   - total paid
+   - balance due
+   - ₱ / php / peso context
+
+4. IMPLEMENT SCORING SYSTEM:
+   Instead of max(), assign scores to each candidate number:
+   - +100 if near "total" keyword
+   - +80 if near currency symbol (₱, $, php)
+   - +50 if in last 30% of receipt text
+   - -100 if line contains date/time/id/ref/order
+   - -50 if number is part of long digit string (>6 digits)
+
+5. SELECT HIGHEST SCORE candidate as total_amount
+
+6. FALLBACK RULE:
+   Only if no keyword matches:
+   - pick highest scored number (NOT highest value)
+
+7. RETURN DEBUG INFO:
+   - total_amount
+   - raw_text
+   - top 3 candidates with scores (for debugging)
+
+8. KEEP:
+   - Express route structure
+   - multer upload
+   - tesseract.js OCR flow
+
+9. OUTPUT CLEAN CODE ONLY (no explanation)
+
+GOAL RESULT:
+The system should correctly extract values like "P100" from GCash receipts and ignore unrelated numbers like dates, IDs, or reference numbers.
